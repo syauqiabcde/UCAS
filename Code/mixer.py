@@ -252,34 +252,3 @@ def suggest_recipes(
     # tie-breaker (simpler recipe wins when quality is equal).
     results.sort(key=lambda r: (r.delta_e, r.total_drops, len(r.colors)))
     return results[:top_k]
-
-
-# =============================================================
-# CLI demo
-# =============================================================
-def _print_recipe(r: Recipe, target_hex: str) -> None:
-    quality = ("excellent" if r.delta_e < 2 else
-               "good"      if r.delta_e < 5 else
-               "fair"      if r.delta_e < 10 else
-               "poor")
-    parts = " + ".join(f"{n} {c}" for c, n in zip(r.colors, r.drops))
-    print(f"  ΔE={r.delta_e:5.2f} ({quality:9s}) | "
-          f"target={target_hex} predicted={r.predicted_hex} | {parts}")
-
-
-if __name__ == "__main__":
-    import sys
-    target = "#068a85"
-    n_max  = 5
-    total  = 3
-    model  = "rgb_avg"
-
-    print(f"Target color   : {target}")
-    print(f"Max dyes       : {n_max}")
-    print(f"Max total drops: {total}")
-    print(f"Forward model  : {model}")
-    print(f"Base palette   : {list(BASE_COLORS.keys())}")
-    print()
-    print("Top 10 recipes:")
-    for r in suggest_recipes(target, n_max=n_max, total_drops_max=total, model=model):
-        _print_recipe(r, target)
