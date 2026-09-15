@@ -457,19 +457,27 @@ def draw_overlays_on_frame(frame,
 
 
 def frame_to_tk_image(frame, max_width: int = 640):
-    """Convert an OpenCV BGR frame to a PhotoImage suitable for a tk.Canvas.
-    Requires PIL/Pillow. If PIL is missing, returns None.
+    """Convert an OpenCV BGR frame to a (PhotoImage, PIL.Image) pair for Tk.
+
+    IMPORTANT: the CALLER MUST KEEP A REFERENCE TO BOTH returned objects for
+    as long as the image is displayed. Tk holds only a weak reference to the
+    PhotoImage's pixel buffer, and Python will garbage-collect the underlying
+    PIL Image the moment nothing points to it — the canvas then shows an
+    empty/black rectangle. This is a well-known Tk gotcha.
+
+    Returns (None, None) if PIL isn't available or the frame is empty.
     """
     if not VISION_AVAILABLE or frame is None:
-        return None
+        return None, None
     try:
         from PIL import Image, ImageTk
     except Exception:
-        return None
+        return None, None
     h, w = frame.shape[:2]
     if w > max_width:
         scale = max_width / w
         frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
-    # BGR -> RGB
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return ImageTk.PhotoImage(image=Image.fromarray(rgb))
+    pil_img = Image.fromarray(rgb)
+    photo = ImageTk.PhotoImage(image=pil_img)
+    return photo, pil_img

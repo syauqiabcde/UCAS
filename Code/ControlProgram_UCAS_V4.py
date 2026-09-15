@@ -1587,6 +1587,7 @@ class CameraFrame(ttk.Frame):
         self._click_mode = "IDLE"
         self._pending_polygon: list[tuple[float, float]] = []
         self._last_photo = None    # keep a reference so tk doesn't GC it
+        self._last_pil = None      # keep the underlying PIL image alive too
         self._latest_frame_size = (1, 1)   # actual frame w,h (before display resize)
         self._display_size = (1, 1)        # displayed w,h
         self._cameras_started = False
@@ -1768,13 +1769,20 @@ class CameraFrame(ttk.Frame):
                         cv2.polylines(annotated, [pts], isClosed=False,
                                       color=(0, 255, 255), thickness=2)
 
-                # Convert to PhotoImage and display
-                photo = frame_to_tk_image(annotated, max_width=800)
+                # Convert to PhotoImage and display.
+                # CRITICAL: we must keep references to BOTH the PhotoImage and
+                # the underlying PIL Image, or Python GC will free the pixel
+                # buffer and the canvas will show black. This is the standard
+                # Tk PhotoImage gotcha.
+                photo, pil_img = frame_to_tk_image(annotated, max_width=800)
                 if photo is not None:
                     self._last_photo = photo
+                    self._last_pil = pil_img
                     self.canvas.delete("frame")
+                    # Draw at (0,0) anchored to top-left. Configure canvas size
+                    # to match the image so the display area doesn't stay tiny.
+                    self.canvas.config(width=photo.width(), height=photo.height())
                     self.canvas.create_image(0, 0, image=photo, anchor="nw", tags="frame")
-                    # Track the display size for click→frame mapping
                     self._display_size = (photo.width(), photo.height())
 
         self.after(self.FRAME_POLL_MS, self._poll_frame)
