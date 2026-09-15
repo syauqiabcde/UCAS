@@ -1,3 +1,25 @@
+"""
+UCAS Control Program V8
+=======================
+Changes from V7:
+  1. Camera integration via `vision_module`. Supports up to two cameras
+     (overhead and head-mounted); the overhead camera drives calibration
+     and the virtual boundary.
+  2. Pixel<->step calibration from two manually-jogged reference points.
+     No printed markers required.
+  3. Virtual boundary polygon for X/Y motion, drawn by clicking points on
+     the camera feed. Enforced the same way as Z/P limits:
+       - Manual jog: clamp target to nearest polygon edge
+       - Auto mode: refuse move that would exit polygon
+  4. "Go home" jogs to a user-selected point inside the polygon.
+  5. New "Camera" tab in the main window shows live feed with overlays
+     (boundary, head position, calibration points).
+
+Depends on: pyserial, mixer.py, webcolors (optional), opencv-python (optional),
+            Pillow (optional).
+If OpenCV or Pillow is missing, the app still runs in V7-style mode without
+camera features.
+"""
 
 from __future__ import annotations
 
@@ -142,8 +164,9 @@ def default_config() -> dict:
         # ---- Vision / camera ----
         # Device indices for overhead and head-mounted cameras. On Windows,
         # 0 is usually the first USB webcam; try 1, 2 to find each camera.
+        # Set head index to -1 if you only have the overhead camera.
         "camera_overhead_index": 0,
-        "camera_head_index": 1,
+        "camera_head_index": -1,
         # Calibration matrix + anchor points (empty until user calibrates).
         "calibration": None,
         # Virtual boundary polygon (empty until user draws one).
@@ -393,8 +416,10 @@ class SettingsDialog(tk.Toplevel):
             self.cam_hd.grid(row=1, column=1, sticky="w", **pad)
 
             ttk.Label(cam_frame, text=(
-                "Try 0, 1, 2 to find each camera. Changes take effect after\n"
-                "you stop and restart cameras on the Camera tab."
+                "Try 0, 1, 2 to find each camera. Use -1 for the head-mounted\n"
+                "camera if you only have the overhead one connected.\n"
+                "Changes take effect after you stop and restart cameras\n"
+                "on the Camera tab."
             ), foreground="gray", justify="left"
                      ).grid(row=2, column=0, columnspan=2, sticky="w", **pad)
 
@@ -923,11 +948,12 @@ class UCASApp:
     # ========================================================
     def start_cameras(self) -> None:
         """Start whichever cameras aren't already running. Silent if OpenCV
-        is missing."""
+        is missing. Head camera is skipped if its index is -1 or equals the
+        overhead index (single-camera setup)."""
         if not VISION_AVAILABLE:
             return
         ov_idx = int(self.cfg.get("camera_overhead_index", 0))
-        hd_idx = int(self.cfg.get("camera_head_index", 1))
+        hd_idx = int(self.cfg.get("camera_head_index", -1))
 
         if self.camera_overhead is None:
             self.camera_overhead = CameraThread(ov_idx)
@@ -936,7 +962,9 @@ class UCASApp:
                 print(f"Overhead camera failed to start: {err}")
                 self.camera_overhead = None
 
-        if self.camera_head is None and hd_idx != ov_idx:
+        # Only try the head camera if it has a distinct, non-negative index
+        skip_head = (hd_idx < 0) or (hd_idx == ov_idx)
+        if self.camera_head is None and not skip_head:
             self.camera_head = CameraThread(hd_idx)
             if not self.camera_head.start():
                 err = self.camera_head.last_error
@@ -1574,6 +1602,9 @@ class CameraFrame(ttk.Frame):
                    style="Big.TButton", width=18).pack(anchor="w", **pad)
         ttk.Button(left, text="Stop cameras", command=self._stop_cameras,
                    style="Big.TButton", width=18).pack(anchor="w", **pad)
+        ttk.Button(left, text="Save current frame → PNG",
+                   command=self._save_current_frame,
+                   style="Big.TButton", width=24).pack(anchor="w", **pad)
         self.cam_status = ttk.Label(left, text="Cameras: not started",
                                     style="Normal.TLabel", foreground="gray")
         self.cam_status.pack(anchor="w", **pad)
@@ -1662,6 +1693,42 @@ class CameraFrame(ttk.Frame):
         self.app.stop_cameras()
         self._cameras_started = False
         self.cam_status.config(text="Cameras: stopped", foreground="gray")
+
+    def _save_current_frame(self):
+        """Grab the latest overhead frame and write it to disk. Useful for
+        diagnosing 'display is black' vs 'camera itself returns black'."""
+        cam = self.app.camera_overhead
+        if cam is None:
+            messagebox.showwarning("No camera",
+                "Overhead camera is not started.")
+            return
+        frame = cam.get_latest_frame()
+        if frame is None:
+            messagebox.showwarning("No frame",
+                f"No frame available yet. Camera frame_count = {cam.frame_count}. "
+                "Wait a moment and try again.")
+            return
+        try:
+            import cv2
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "camera_snapshot.png")
+            cv2.imwrite(path, frame)
+            h, w = frame.shape[:2]
+            mean = float(frame.mean())
+            std = float(frame.std())
+            verdict = ("Frame looks BLACK (mean<5, std<5) — camera issue"
+                       if mean < 5 and std < 5 else
+                       "Frame has content — display issue if it looked black in the app"
+                       if std > 10 else
+                       "Frame is very dim — check lighting")
+            messagebox.showinfo("Frame saved",
+                f"Saved to: {path}\n\n"
+                f"Size:  {w}x{h}\n"
+                f"Mean:  {mean:.1f} (0=black, 255=white)\n"
+                f"Std:   {std:.1f} (variance across pixels)\n\n"
+                f"{verdict}")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
 
     # --------------------------------------------------------
     def _poll_frame(self):

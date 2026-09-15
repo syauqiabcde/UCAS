@@ -68,17 +68,57 @@ class CameraThread:
         if self._thread is not None and self._thread.is_alive():
             return True   # already running
 
-        try:
-            self.cap = cv2.VideoCapture(self.device_index)
-            if not self.cap.isOpened():
-                self.last_error = f"Camera {self.device_index} could not be opened."
-                return False
-            # Common defaults; user may override via reconfigure()
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        except Exception as e:
-            self.last_error = str(e)
+        # Try multiple backends in order. On Windows the default (MSMF) often
+        # opens the camera but returns black frames — DSHOW usually works.
+        # On Linux/macOS the default backend is fine.
+        import sys, platform
+        if platform.system() == "Windows":
+            backends_to_try = [
+                ("CAP_DSHOW", cv2.CAP_DSHOW),
+                ("CAP_MSMF",  cv2.CAP_MSMF),
+                ("CAP_ANY",   cv2.CAP_ANY),
+            ]
+        else:
+            backends_to_try = [("CAP_ANY", cv2.CAP_ANY)]
+
+        opened = False
+        for backend_name, backend_flag in backends_to_try:
+            try:
+                cap = cv2.VideoCapture(self.device_index, backend_flag)
+                if not cap.isOpened():
+                    cap.release()
+                    continue
+                # Verify we can actually READ a frame, not just open.
+                # Some drivers open successfully but return black frames until
+                # the resolution is negotiated. We test with a short retry.
+                got_real_frame = False
+                for _ in range(10):
+                    ok, frame = cap.read()
+                    if ok and frame is not None and frame.std() > 3:
+                        got_real_frame = True
+                        break
+                    time.sleep(0.1)
+                if not got_real_frame:
+                    cap.release()
+                    continue
+                self.cap = cap
+                opened = True
+                print(f"Camera {self.device_index}: opened with {backend_name}")
+                break
+            except Exception as e:
+                self.last_error = str(e)
+                continue
+
+        if not opened:
+            self.last_error = (
+                f"Camera {self.device_index}: no backend delivered valid frames. "
+                f"Try a different camera index, or close other apps using the camera."
+            )
             return False
+
+        # Do NOT force a specific resolution — many webcams silently refuse
+        # unsupported modes and then return black frames. Use whatever the
+        # driver gives us as its default.
 
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
