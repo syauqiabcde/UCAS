@@ -250,6 +250,77 @@ def axis_limits(cfg: dict, axis: str) -> tuple[int, int] | None:
     # Ensure ordered
     return (min(lo, hi), max(lo, hi))
 
+# ============================================================
+# SCROLLABLE FRAME HELPER
+# ============================================================
+
+class ScrollableFrame(ttk.Frame):
+    """A ttk.Frame with horizontal and vertical scrollbars.
+
+    Usage:
+        outer = ScrollableFrame(parent)
+        outer.pack(fill="both", expand=True)
+        # Put your widgets in outer.inner, NOT in outer itself.
+        ttk.Button(outer.inner, text="hi").pack()
+
+    The inner frame automatically expands and the canvas's scrollregion
+    is kept in sync with the inner frame's real size.
+    """
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+
+        # A tk.Canvas is the only Tk widget that natively scrolls.
+        self._canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        vbar = ttk.Scrollbar(self, orient="vertical",
+                             command=self._canvas.yview)
+        hbar = ttk.Scrollbar(self, orient="horizontal",
+                             command=self._canvas.xview)
+        self._canvas.configure(yscrollcommand=vbar.set,
+                               xscrollcommand=hbar.set)
+
+        # Layout: canvas center, scrollbars right and bottom.
+        self._canvas.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
+        hbar.grid(row=1, column=0, sticky="ew")
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        # The frame that holds the actual content. This is what callers
+        # should populate.
+        self.inner = ttk.Frame(self._canvas)
+        self._window_id = self._canvas.create_window(
+            (0, 0), window=self.inner, anchor="nw")
+
+        # Keep scrollregion synced with inner frame size, so scrollbars
+        # correctly reflect what's scrollable.
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        # When the canvas is resized (e.g. window maximized), don't force
+        # the inner frame to match — that would defeat scrolling. We only
+        # sync the scroll region, not the inner size.
+
+        # Enable mouse-wheel scrolling anywhere over the frame.
+        # Windows/macOS use <MouseWheel>; Linux uses Button-4/Button-5.
+        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self._canvas.bind_all("<Button-4>", self._on_mousewheel_linux_up)
+        self._canvas.bind_all("<Button-5>", self._on_mousewheel_linux_down)
+
+    def _on_inner_configure(self, event):
+        # bbox("all") returns the bounding box of every item on the canvas,
+        # which is the size of the inner frame. That becomes the scrollable area.
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_mousewheel(self, event):
+        # event.delta is 120 per notch on Windows, but a small number on macOS.
+        # Dividing by 120 gives us a canonical "notches" value.
+        self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_mousewheel_linux_up(self, event):
+        self._canvas.yview_scroll(-1, "units")
+
+    def _on_mousewheel_linux_down(self, event):
+        self._canvas.yview_scroll(1, "units")
+
 
 # ============================================================
 # SETTINGS DIALOG
@@ -530,6 +601,13 @@ class UCASApp:
         style.configure("Status.TLabel", font=self.status_font)
 
         self._build_menu()
+
+        # Everything below the menu bar goes inside a scrollable container so
+        # the user can scroll horizontally and vertically at any window size.
+        self._scroll = ScrollableFrame(self.root)
+        self._scroll.pack(fill="both", expand=True)
+        self._scroll_root = self._scroll.inner   # <- everything else parents here
+
         self._build_top_bar()
         self._build_mode_switch()
         self._build_mode_container()
@@ -583,7 +661,7 @@ class UCASApp:
 
     # --------------------------------------------------------
     def _build_top_bar(self):
-        bar = ttk.Frame(self.root)
+        bar = ttk.Frame(self._scroll_root)
         bar.pack(fill="x", padx=10, pady=8)
         ttk.Button(bar, text="Connect", command=self.connect,
                    style="Big.TButton", width=11).pack(side="left", padx=4)
@@ -618,7 +696,7 @@ class UCASApp:
         self.stop_requested = False
 
     def _build_mode_switch(self):
-        frame = ttk.Frame(self.root)
+        frame = ttk.Frame(self._scroll_root)
         frame.pack(fill="x", padx=10, pady=(0, 6))
         ttk.Label(frame, text="Mode:", style="Big.TLabel"
                   ).pack(side="left", padx=(0, 10))
@@ -635,7 +713,7 @@ class UCASApp:
                             ).pack(side="left", padx=4)
 
     def _build_mode_container(self):
-        self.mode_container = ttk.Frame(self.root)
+        self.mode_container = ttk.Frame(self._scroll_root)
         self.mode_container.pack(fill="both", expand=True, padx=10, pady=6)
         self.manual_frame = ManualModeFrame(self.mode_container, self)
         self.auto_frame = AutoModeFrame(self.mode_container, self)
@@ -1610,6 +1688,11 @@ class CameraFrame(ttk.Frame):
                                     style="Normal.TLabel", foreground="gray")
         self.cam_status.pack(anchor="w", **pad)
 
+        # Diagnostic status showing what the polling loop is doing
+        self.poll_status = ttk.Label(left, text="Poll: not started",
+                                    style="Normal.TLabel", foreground="gray")
+        self.poll_status.pack(anchor="w", **pad)
+
         ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
 
         ttk.Label(left, text="Calibration", style="Big.TLabel").pack(anchor="w", **pad)
@@ -1657,25 +1740,40 @@ class CameraFrame(ttk.Frame):
                                      style="Normal.TLabel", foreground="blue")
         self.mode_status.pack(anchor="w", **pad)
 
-        # ---- Right: the live camera canvas ----
+        # ---- Right: two camera views side by side ----
         right = ttk.Frame(self)
         right.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
-        ttk.Label(right, text="Overhead camera (click to interact)",
+        # Overhead camera panel
+        ov_panel = ttk.Frame(right)
+        ov_panel.grid(row=0, column=0, sticky="nw", padx=(0, 8))
+        ttk.Label(ov_panel, text="Overhead camera (click to interact)",
                   style="Big.TLabel").pack(anchor="w")
-        self.canvas = tk.Canvas(right, width=800, height=600, bg="black",
+        # Start small; canvas will resize to actual frame size on first paint
+        self.canvas = tk.Canvas(ov_panel, width=1, height=1, bg="black",
                                 highlightthickness=1, highlightbackground="gray")
-        self.canvas.pack(fill="both", expand=True)
+        self.canvas.pack()
         self.canvas.bind("<Button-1>", self._on_canvas_click)
         self.canvas.bind("<Double-Button-1>", self._on_canvas_double_click)
 
-        # Working state for calibration anchors during setup
-        self._cal_anchor_steps: list[tuple[int, int] | None] = [None, None]
-        self._cal_anchor_pixels: list[tuple[float, float] | None] = [None, None]
+        # Head-mounted camera panel
+        hd_panel = ttk.Frame(right)
+        hd_panel.grid(row=0, column=1, sticky="nw")
+        ttk.Label(hd_panel, text="Head-mounted camera",
+                  style="Big.TLabel").pack(anchor="w")
+        self.head_canvas = tk.Canvas(hd_panel, width=1, height=1, bg="black",
+                                     highlightthickness=1, highlightbackground="gray")
+        self.head_canvas.pack()
+        self.head_status = ttk.Label(hd_panel,
+                                     text="Head camera not connected",
+                                     style="Normal.TLabel", foreground="gray")
+        self.head_status.pack(anchor="w", pady=(4, 0))
 
-        self._refresh_status_labels()
+        # Keep references to head-cam images so Tk doesn't GC them
+        self._head_last_photo = None
+        self._head_last_pil = None
 
     # --------------------------------------------------------
     def on_show(self):
@@ -1734,56 +1832,128 @@ class CameraFrame(ttk.Frame):
     # --------------------------------------------------------
     def _poll_frame(self):
         """Read the latest frame from the overhead camera, overlay,
-        and paint onto the canvas. Reschedules itself."""
+        and paint onto the canvas. Reschedules itself.
+
+        Heavily instrumented to help diagnose why nothing shows on the canvas.
+        """
         if not self._cameras_started:
+            self.poll_status.config(text="Poll: stopped (cameras not started)")
             return
 
         cam = self.app.camera_overhead
-        if cam is not None:
-            frame = cam.get_latest_frame()
-            if frame is not None:
-                self._latest_frame_size = (frame.shape[1], frame.shape[0])
+        if cam is None:
+            self.poll_status.config(
+                text="Poll: no overhead camera object", foreground="red")
+            self.after(self.FRAME_POLL_MS, self._poll_frame)
+            return
 
-                head_step = (self.app.current_position["X"],
-                             self.app.current_position["Y"])
+        frame = cam.get_latest_frame()
+        if frame is None:
+            # Camera exists but no frame yet — normal during first ~1s
+            self.poll_status.config(
+                text=f"Poll: waiting for first frame (count={cam.frame_count})",
+                foreground="orange")
+            self.after(self.FRAME_POLL_MS, self._poll_frame)
+            return
 
-                # Overlay boundary, calibration, head position
-                annotated = draw_overlays_on_frame(
-                    frame,
-                    self.app.boundary,
-                    self.app.calibration,
-                    head_step=head_step,
-                )
+        self._latest_frame_size = (frame.shape[1], frame.shape[0])
 
-                # Overlay pending polygon during drawing
-                if self._click_mode == "DRAW_POLY" and self._pending_polygon:
-                    import cv2, numpy as np
-                    if len(self._pending_polygon) >= 1:
-                        for (u, v) in self._pending_polygon:
-                            cv2.circle(annotated, (int(u), int(v)), 4, (0, 255, 255), -1)
-                    if len(self._pending_polygon) >= 2:
-                        pts = np.array(
-                            [[int(u), int(v)] for u, v in self._pending_polygon],
-                            dtype=np.int32
-                        )
-                        cv2.polylines(annotated, [pts], isClosed=False,
-                                      color=(0, 255, 255), thickness=2)
+        # Apply overlays
+        head_step = (self.app.current_position["X"],
+                    self.app.current_position["Y"])
+        try:
+            annotated = draw_overlays_on_frame(
+                frame, self.app.boundary, self.app.calibration,
+                head_step=head_step,
+            )
+        except Exception as e:
+            annotated = frame
+            print(f"Overlay error (using raw frame): {e}")
 
-                # Convert to PhotoImage and display.
-                # CRITICAL: we must keep references to BOTH the PhotoImage and
-                # the underlying PIL Image, or Python GC will free the pixel
-                # buffer and the canvas will show black. This is the standard
-                # Tk PhotoImage gotcha.
-                photo, pil_img = frame_to_tk_image(annotated, max_width=800)
-                if photo is not None:
-                    self._last_photo = photo
-                    self._last_pil = pil_img
-                    self.canvas.delete("frame")
-                    # Draw at (0,0) anchored to top-left. Configure canvas size
-                    # to match the image so the display area doesn't stay tiny.
-                    self.canvas.config(width=photo.width(), height=photo.height())
-                    self.canvas.create_image(0, 0, image=photo, anchor="nw", tags="frame")
-                    self._display_size = (photo.width(), photo.height())
+        # Overlay pending polygon during drawing
+        if self._click_mode == "DRAW_POLY" and self._pending_polygon:
+            try:
+                import cv2, numpy as np
+                for (u, v) in self._pending_polygon:
+                    cv2.circle(annotated, (int(u), int(v)), 4, (0, 255, 255), -1)
+                if len(self._pending_polygon) >= 2:
+                    pts = np.array(
+                        [[int(u), int(v)] for u, v in self._pending_polygon],
+                        dtype=np.int32)
+                    cv2.polylines(annotated, [pts], isClosed=False,
+                                color=(0, 255, 255), thickness=2)
+            except Exception as e:
+                print(f"Pending polygon draw error: {e}")
+
+        # Convert to PhotoImage
+        try:
+            photo, pil_img = frame_to_tk_image(annotated, max_width=800)
+        except Exception as e:
+            self.poll_status.config(
+                text=f"Poll: frame_to_tk_image raised: {e}", foreground="red")
+            print(f"frame_to_tk_image raised: {e}")
+            self.after(self.FRAME_POLL_MS, self._poll_frame)
+            return
+
+        if photo is None:
+            # This is Possibility 2 from my analysis: PIL/ImageTk missing.
+            self.poll_status.config(
+                text="Poll: frame_to_tk_image returned None — PIL/ImageTk missing?",
+                foreground="red")
+            self.after(self.FRAME_POLL_MS, self._poll_frame)
+            return
+
+        # Keep both alive to defeat Tk's PhotoImage GC gotcha
+        self._last_photo = photo
+        self._last_pil = pil_img
+
+        # Force canvas to size to the image; without this, an unrealized canvas
+        # can end up 1x1 pixel and hide the image behind its own black border.
+        try:
+            self.canvas.config(width=photo.width(), height=photo.height())
+            self.canvas.delete("frame")
+            self.canvas.create_image(0, 0, image=photo, anchor="nw", tags="frame")
+            # Some Tk versions need an explicit update to actually render
+            self.canvas.update_idletasks()
+            self._display_size = (photo.width(), photo.height())
+            self.poll_status.config(
+                text=f"Poll: frame #{cam.frame_count}  "
+                    f"({self._latest_frame_size[0]}x{self._latest_frame_size[1]} -> "
+                    f"{photo.width()}x{photo.height()})",
+                foreground="green")
+        except Exception as e:
+            self.poll_status.config(
+                text=f"Poll: canvas render failed: {e}", foreground="red")
+            print(f"Canvas render failed: {e}")
+
+        # ---- Head-mounted camera (independent, half size for space) ----
+        head_cam = self.app.camera_head
+        if head_cam is not None:
+            head_frame = head_cam.get_latest_frame()
+            if head_frame is not None:
+                try:
+                    photo_h, pil_h = frame_to_tk_image(head_frame, max_width=400)
+                    if photo_h is not None:
+                        self._head_last_photo = photo_h
+                        self._head_last_pil = pil_h
+                        self.head_canvas.config(width=photo_h.width(),
+                                                height=photo_h.height())
+                        self.head_canvas.delete("frame")
+                        self.head_canvas.create_image(0, 0, image=photo_h,
+                                                      anchor="nw", tags="frame")
+                        self.head_status.config(
+                            text=f"Head cam frame #{head_cam.frame_count}",
+                            foreground="green")
+                except Exception as e:
+                    self.head_status.config(
+                        text=f"Head cam render error: {e}", foreground="red")
+            else:
+                self.head_status.config(
+                    text=f"Head cam: waiting for frame (count={head_cam.frame_count})",
+                    foreground="orange")
+        else:
+            self.head_status.config(text="Head camera not connected",
+                                    foreground="gray")
 
         self.after(self.FRAME_POLL_MS, self._poll_frame)
 

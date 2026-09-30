@@ -52,7 +52,7 @@
   "accel_Z": 1000,
   "accel_P": 2000,
   "camera_overhead_index": 0,
-  "camera_head_index": 0,
+  "camera_head_index": -1,
   "calibration": null,
   "boundary": null
 }
