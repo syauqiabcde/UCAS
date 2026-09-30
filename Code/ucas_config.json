@@ -1,0 +1,58 @@
+{
+  "coordinates": {
+    "yellow": {
+      "X": 0,
+      "Y": 0
+    },
+    "orange": {
+      "X": 0,
+      "Y": 0
+    },
+    "pink": {
+      "X": 0,
+      "Y": 0
+    },
+    "red": {
+      "X": 0,
+      "Y": 0
+    },
+    "green": {
+      "X": 0,
+      "Y": 0
+    },
+    "blue": {
+      "X": 0,
+      "Y": 0
+    },
+    "violet": {
+      "X": 0,
+      "Y": 0
+    },
+    "black": {
+      "X": 0,
+      "Y": 0
+    },
+    "target": {
+      "X": 0,
+      "Y": 0
+    }
+  },
+  "steps_per_coord_X": 1000,
+  "steps_per_coord_Y": 1000,
+  "z_up": 0,
+  "z_down": 0,
+  "pipette_up": 0,
+  "pipette_down": 0,
+  "speed_X": 4000,
+  "speed_Y": 4000,
+  "speed_Z": 2000,
+  "speed_P": 4000,
+  "accel_X": 2000,
+  "accel_Y": 2000,
+  "accel_Z": 1000,
+  "accel_P": 2000,
+  "camera_overhead_index": 0,
+  "camera_head_index": 0,
+  "calibration": null,
+  "boundary": null
+}
