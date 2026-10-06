@@ -188,6 +188,45 @@ class Calibration:
         return self.matrix_px_to_step is not None
 
     @classmethod
+    def from_four_points(cls,
+                         pixel_points: list[tuple[float, float]],
+                         step_points: list[tuple[int, int]]
+                         ) -> "Calibration":
+        """Fit a full 3x3 homography from four (or more) pixel-step pairs.
+
+        Unlike from_two_points (similarity transform: translation + uniform
+        scale + rotation), a homography handles perspective distortion. This
+        matters if the camera is not perfectly perpendicular to the workspace.
+
+        For four input pairs the fit is exact. For more pairs it's least-squares.
+        """
+        if len(pixel_points) != len(step_points):
+            raise ValueError("pixel_points and step_points must have the same length")
+        if len(pixel_points) < 4:
+            raise ValueError("Need at least 4 point pairs for a homography")
+
+        src = np.array(pixel_points, dtype=np.float32)
+        dst = np.array(step_points, dtype=np.float32)
+        H, _ = cv2.findHomography(src, dst, method=0)   # 0 = plain least-squares
+        if H is None:
+            raise ValueError("Homography fit failed (points may be collinear)")
+
+        # Store as a 2x3 affine approximation of the homography for the forward
+        # transform. For a well-conditioned perspective, the 2x3 "upper" part
+        # is a good enough approximation at the detection points; for full
+        # accuracy we keep the complete 3x3 in a separate field.
+        # Easier: store the complete 3x3 and override pixel_to_step/step_to_pixel.
+        cal = cls()
+        cal._homography = H.tolist()
+        cal._homography_inv = np.linalg.inv(H).tolist()
+        cal.anchor_pixels = list(pixel_points)
+        cal.anchor_steps = list(step_points)
+        # Keep matrix_px_to_step populated too so legacy code paths see is_valid=True.
+        cal.matrix_px_to_step = [H[0, 0], H[0, 1], H[0, 2],
+                                 H[1, 0], H[1, 1], H[1, 2]]
+        return cal
+    
+    @classmethod
     def from_two_points(cls,
                         px1: tuple[float, float], step1: tuple[int, int],
                         px2: tuple[float, float], step2: tuple[int, int]
@@ -231,22 +270,36 @@ class Calibration:
     def pixel_to_step(self, u: float, v: float) -> tuple[int, int]:
         if not self.is_valid:
             raise RuntimeError("Calibration is not set.")
+        # Use full 3x3 homography if available (from_four_points)
+        if getattr(self, "_homography", None) is not None:
+            H = self._homography
+            w = H[2][0] * u + H[2][1] * v + H[2][2]
+            if abs(w) < 1e-9:
+                raise RuntimeError("Homography returned zero w — degenerate point")
+            X = (H[0][0] * u + H[0][1] * v + H[0][2]) / w
+            Y = (H[1][0] * u + H[1][1] * v + H[1][2]) / w
+            return int(round(X)), int(round(Y))
+        # Fallback: 2x3 similarity (from_two_points)
         m = self.matrix_px_to_step
         X = m[0] * u + m[1] * v + m[2]
         Y = m[3] * u + m[4] * v + m[5]
         return int(round(X)), int(round(Y))
 
     def step_to_pixel(self, X: float, Y: float) -> tuple[float, float]:
-        """Inverse transform. Similarity transforms are trivially invertible."""
         if not self.is_valid:
             raise RuntimeError("Calibration is not set.")
+        # Full 3x3 inverse if available
+        if getattr(self, "_homography_inv", None) is not None:
+            Hi = self._homography_inv
+            w = Hi[2][0] * X + Hi[2][1] * Y + Hi[2][2]
+            if abs(w) < 1e-9:
+                raise RuntimeError("Inverse homography degenerate")
+            u = (Hi[0][0] * X + Hi[0][1] * Y + Hi[0][2]) / w
+            v = (Hi[1][0] * X + Hi[1][1] * Y + Hi[1][2]) / w
+            return u, v
+        # Fallback: 2x3 similarity inverse
         m = self.matrix_px_to_step
-        # Forward is:  [X]   [a  -b] [u]   [tx]
-        #              [Y] = [b   a] [v] + [ty]
-        # So inverse:  [u]   1     [ a   b] [X - tx]
-        #              [v] = --- * [-b   a] [Y - ty]
-        #                    a²+b²
-        a, mb = m[0], m[1]   # mb is -b, so b = -mb
+        a, mb = m[0], m[1]
         b = -mb
         det = a * a + b * b
         if det < 1e-9:
@@ -258,11 +311,15 @@ class Calibration:
         return u, v
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "matrix_px_to_step": self.matrix_px_to_step,
             "anchor_pixels": self.anchor_pixels,
             "anchor_steps": self.anchor_steps,
         }
+        if getattr(self, "_homography", None) is not None:
+            d["homography"] = self._homography
+            d["homography_inv"] = self._homography_inv
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "Calibration":
@@ -270,6 +327,9 @@ class Calibration:
         c.matrix_px_to_step = d.get("matrix_px_to_step")
         c.anchor_pixels = [tuple(p) for p in d.get("anchor_pixels", [])]
         c.anchor_steps = [tuple(p) for p in d.get("anchor_steps", [])]
+        if d.get("homography"):
+            c._homography = d["homography"]
+            c._homography_inv = d.get("homography_inv")
         return c
 
 

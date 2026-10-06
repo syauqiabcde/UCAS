@@ -138,6 +138,7 @@ def resolve_color_input(text: str) -> tuple[str | None, str | None]:
 
 
 def default_config() -> dict:
+
     """Fresh config. USER MUST CALIBRATE before use."""
     color_names = list(BASE_COLORS.keys()) if BASE_COLORS else [
         "yellow", "orange", "pink", "red", "green", "blue", "violet", "black"
@@ -171,6 +172,20 @@ def default_config() -> dict:
         "calibration": None,
         # Virtual boundary polygon (empty until user draws one).
         "boundary": None,
+        # ---- Auto-calibration parameters ----
+        # Direction probe: small test move used to determine pixel<->step
+        # sign convention automatically. Keep small enough to be safe.
+        "autocal_probe_steps": 500,
+        # When jogging toward a corner marker, stop once the head marker is
+        # within this many pixels of the target corner marker.
+        "autocal_convergence_px": 5,
+        # Initial steps-per-pixel guess, used only for the first corner.
+        # Later corners use refined estimates from previous iterations.
+        "autocal_initial_steps_per_pixel": 700,
+        # Maximum iterations when converging on one corner (safety bound).
+        "autocal_max_iterations": 8,
+        # Maximum step delta per single jog (safety cap, prevents runaway).
+        "autocal_max_step_per_jog": 5000,
     }
 
 
@@ -1695,34 +1710,28 @@ class CameraFrame(ttk.Frame):
 
         ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
 
-        ttk.Label(left, text="Calibration", style="Big.TLabel").pack(anchor="w", **pad)
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
+
+        ttk.Label(left, text="Auto-calibration", style="Big.TLabel").pack(anchor="w", **pad)
         ttk.Label(left,
-                  text=("2-point calibration:\n"
-                        "  1. Jog head to point A, use 'Set A here'\n"
-                        "  2. Click point A in the camera image\n"
-                        "  3. Jog to point B (far from A), 'Set B here'\n"
-                        "  4. Click point B in the image\n"
-                        "Save when done."),
+                  text=("Uses ArUco markers 1-4 on the UCAS corners and\n"
+                        "marker 0 on the head. The routine will:\n"
+                        "  1. Probe +X and +Y to learn sign conventions\n"
+                        "  2. Jog head to corner 1, 2, 3, 4 in sequence\n"
+                        "  3. Fit homography and save calibration\n"
+                        "Jog to a central safe starting point first."),
                   style="Normal.TLabel", foreground="gray", justify="left"
                   ).pack(anchor="w", **pad)
-        ttk.Button(left, text="Set A here (current XY)",
-                   command=lambda: self._set_calibration_step_anchor(0),
-                   style="Big.TButton", width=24).pack(anchor="w", **pad)
-        ttk.Button(left, text="Click A in image →",
-                   command=lambda: self._enter_click_mode("CAL_POINT_1"),
-                   style="Big.TButton", width=24).pack(anchor="w", **pad)
-        ttk.Button(left, text="Set B here (current XY)",
-                   command=lambda: self._set_calibration_step_anchor(1),
-                   style="Big.TButton", width=24).pack(anchor="w", **pad)
-        ttk.Button(left, text="Click B in image →",
-                   command=lambda: self._enter_click_mode("CAL_POINT_2"),
-                   style="Big.TButton", width=24).pack(anchor="w", **pad)
-        ttk.Button(left, text="Compute & save calibration",
-                   command=self._save_calibration,
+        ttk.Button(left, text="Start auto-calibration",
+                   command=self._start_auto_calibration,
                    style="Big.TButton", width=24).pack(anchor="w", **pad)
         self.cal_status = ttk.Label(left, text="Calibration: —",
                                     style="Normal.TLabel", foreground="gray")
         self.cal_status.pack(anchor="w", **pad)
+        self.autocal_log = ttk.Label(left, text="",
+                                     style="Normal.TLabel", foreground="blue",
+                                     wraplength=240, justify="left")
+        self.autocal_log.pack(anchor="w", **pad)
 
         ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
 
@@ -1974,23 +1983,7 @@ class CameraFrame(ttk.Frame):
             return
         u, v = self._canvas_to_frame_coords(event.x, event.y)
 
-        if self._click_mode == "CAL_POINT_1":
-            self._cal_anchor_pixels[0] = (u, v)
-            self._exit_click_mode()
-            messagebox.showinfo("Point A captured",
-                f"Pixel A recorded: ({u:.0f}, {v:.0f})\n\n"
-                f"Now jog to point B and 'Set B here', then 'Click B in image'.")
-            self._refresh_status_labels()
-
-        elif self._click_mode == "CAL_POINT_2":
-            self._cal_anchor_pixels[1] = (u, v)
-            self._exit_click_mode()
-            messagebox.showinfo("Point B captured",
-                f"Pixel B recorded: ({u:.0f}, {v:.0f})\n\n"
-                f"Click 'Compute & save calibration' to finish.")
-            self._refresh_status_labels()
-
-        elif self._click_mode == "DRAW_POLY":
+        if self._click_mode == "DRAW_POLY":
             self._pending_polygon.append((u, v))
             self.mode_status.config(
                 text=f"Drawing polygon: {len(self._pending_polygon)} points (double-click to finish)",
@@ -2007,42 +2000,242 @@ class CameraFrame(ttk.Frame):
     # --------------------------------------------------------
     # CALIBRATION
     # --------------------------------------------------------
-    def _set_calibration_step_anchor(self, which: int):
-        """Record the machine's current XY as one of the two calibration anchors."""
-        x = self.app.current_position["X"]
-        y = self.app.current_position["Y"]
-        self._cal_anchor_steps[which] = (x, y)
-        letter = "A" if which == 0 else "B"
-        self.cal_status.config(text=f"Step position {letter} set: ({x}, {y})",
-                               foreground="blue")
+    """
+    Removing manual calibration
+    """
+    # def _set_calibration_step_anchor(self, which: int):
+    #     """Record the machine's current XY as one of the two calibration anchors."""
+    #     x = self.app.current_position["X"]
+    #     y = self.app.current_position["Y"]
+    #     self._cal_anchor_steps[which] = (x, y)
+    #     letter = "A" if which == 0 else "B"
+    #     self.cal_status.config(text=f"Step position {letter} set: ({x}, {y})",
+    #                            foreground="blue")
 
-    def _save_calibration(self):
-        for i, letter in enumerate(("A", "B")):
-            if self._cal_anchor_steps[i] is None:
-                messagebox.showwarning("Incomplete calibration",
-                                       f"Step position for point {letter} is not set.")
-                return
-            if self._cal_anchor_pixels[i] is None:
-                messagebox.showwarning("Incomplete calibration",
-                                       f"Pixel position for point {letter} is not set.")
-                return
-        try:
-            cal = Calibration.from_two_points(
-                self._cal_anchor_pixels[0], self._cal_anchor_steps[0],
-                self._cal_anchor_pixels[1], self._cal_anchor_steps[1],
-            )
-        except ValueError as e:
-            messagebox.showerror("Calibration failed", str(e))
+    # def _save_calibration(self):
+    #     for i, letter in enumerate(("A", "B")):
+    #         if self._cal_anchor_steps[i] is None:
+    #             messagebox.showwarning("Incomplete calibration",
+    #                                    f"Step position for point {letter} is not set.")
+    #             return
+    #         if self._cal_anchor_pixels[i] is None:
+    #             messagebox.showwarning("Incomplete calibration",
+    #                                    f"Pixel position for point {letter} is not set.")
+    #             return
+    #     try:
+    #         cal = Calibration.from_two_points(
+    #             self._cal_anchor_pixels[0], self._cal_anchor_steps[0],
+    #             self._cal_anchor_pixels[1], self._cal_anchor_steps[1],
+    #         )
+    #     except ValueError as e:
+    #         messagebox.showerror("Calibration failed", str(e))
+    #         return
+    #     self.app.calibration = cal
+    #     self.app.save_vision_to_config()
+    #     messagebox.showinfo("Calibration saved",
+    #         f"Calibration ready.\n\n"
+    #         f"Pixel A ({self._cal_anchor_pixels[0][0]:.0f}, {self._cal_anchor_pixels[0][1]:.0f}) "
+    #         f"↔ step {self._cal_anchor_steps[0]}\n"
+    #         f"Pixel B ({self._cal_anchor_pixels[1][0]:.0f}, {self._cal_anchor_pixels[1][1]:.0f}) "
+    #         f"↔ step {self._cal_anchor_steps[1]}")
+    #     self._refresh_status_labels()
+
+        # --------------------------------------------------------
+    # AUTO-CALIBRATION (V8)
+    # --------------------------------------------------------
+    def _start_auto_calibration(self):
+        """Entry point. Validates preconditions and runs the full routine."""
+        if not VISION_AVAILABLE:
+            messagebox.showerror("Vision unavailable", "OpenCV not loaded.")
             return
+        if not self._cameras_started or self.app.camera_overhead is None:
+            messagebox.showwarning("Camera not running",
+                                   "Start the overhead camera first.")
+            return
+        if not self.app.ser or not self.app.ser.is_open:
+            messagebox.showwarning("Not connected",
+                                   "Connect to Arduino first.")
+            return
+        # Need all 5 markers in the current frame
+        if not self._last_aruco or not {0, 1, 2, 3, 4}.issubset(self._last_aruco.keys()):
+            seen = sorted(self._last_aruco.keys()) if self._last_aruco else []
+            messagebox.showwarning("Markers not visible",
+                f"All of IDs 0-4 must be visible. Currently seen: {seen}.\n"
+                f"Fix lighting / occlusion, then try again.")
+            return
+
+        if not messagebox.askyesno("Confirm auto-calibration",
+            "The head will jog toward each corner marker in sequence.\n\n"
+            "Make sure:\n"
+            "  • The head is in a central position with free travel\n"
+            "  • Z is raised to a safe travel height\n"
+            "  • Nothing is obstructing the workspace\n\n"
+            "Proceed?"):
+            return
+
+        self.app.clear_stop()
+        try:
+            self._run_auto_calibration()
+        except Exception as e:
+            messagebox.showerror("Auto-calibration failed", str(e))
+            self.autocal_log.config(text=f"FAILED: {e}", foreground="red")
+
+    def _run_auto_calibration(self):
+        """Full routine. Returns None; raises on failure. Updates status label
+        as it progresses so the user sees what's happening."""
+        import numpy as np
+
+        probe = int(self.app.cfg["autocal_probe_steps"])
+        convergence_px = float(self.app.cfg["autocal_convergence_px"])
+        initial_spp = float(self.app.cfg["autocal_initial_steps_per_pixel"])
+        max_iter = int(self.app.cfg["autocal_max_iterations"])
+        max_jog = int(self.app.cfg["autocal_max_step_per_jog"])
+
+        # ---- Step 1: direction probe ----
+        self._log_autocal("Probing +X direction...")
+        head_before = self._get_fresh_marker_pixel(0)
+        if not self.app.send_motion(f"M X{probe}", enforce_limits=True, clamp_z_p=False):
+            raise RuntimeError("X probe move failed")
+        time.sleep(0.3)
+        head_after = self._get_fresh_marker_pixel(0)
+        dx_px_from_X = head_after[0] - head_before[0]
+        dy_px_from_X = head_after[1] - head_before[1]
+        # Undo the probe
+        self.app.send_motion(f"M X{-probe}", enforce_limits=True, clamp_z_p=False)
+        time.sleep(0.3)
+
+        if self.app.stop_requested:
+            raise RuntimeError("Stopped by user")
+
+        self._log_autocal(f"X probe: pixel Δ=({dx_px_from_X:+.1f},{dy_px_from_X:+.1f})")
+
+        self._log_autocal("Probing +Y direction...")
+        head_before = self._get_fresh_marker_pixel(0)
+        if not self.app.send_motion(f"M Y{probe}", enforce_limits=True, clamp_z_p=False):
+            raise RuntimeError("Y probe move failed")
+        time.sleep(0.3)
+        head_after = self._get_fresh_marker_pixel(0)
+        dx_px_from_Y = head_after[0] - head_before[0]
+        dy_px_from_Y = head_after[1] - head_before[1]
+        self.app.send_motion(f"M Y{-probe}", enforce_limits=True, clamp_z_p=False)
+        time.sleep(0.3)
+
+        if self.app.stop_requested:
+            raise RuntimeError("Stopped by user")
+
+        self._log_autocal(f"Y probe: pixel Δ=({dx_px_from_Y:+.1f},{dy_px_from_Y:+.1f})")
+
+        # ---- Step 2: build Jacobian (pixel_delta = J @ step_delta) ----
+        # J is 2x2:  [dx_px/dx_step  dx_px/dy_step]
+        #           [dy_px/dx_step  dy_px/dy_step]
+        J = np.array([
+            [dx_px_from_X / probe, dx_px_from_Y / probe],
+            [dy_px_from_X / probe, dy_px_from_Y / probe],
+        ])
+        try:
+            J_inv = np.linalg.inv(J)
+        except np.linalg.LinAlgError:
+            raise RuntimeError("Probe moves produced degenerate Jacobian "
+                               "(camera may not see head motion clearly)")
+        self._log_autocal(f"Jacobian OK, condition {np.linalg.cond(J):.1f}")
+
+        # ---- Step 3: visit each corner ----
+        step_points: list[tuple[int, int]] = []
+        pixel_points: list[tuple[float, float]] = []
+
+        for corner_id in (1, 2, 3, 4):
+            if self.app.stop_requested:
+                raise RuntimeError("Stopped by user")
+
+            self._log_autocal(f"Approaching corner marker {corner_id}...")
+            corner_px = self._get_fresh_marker_pixel(corner_id)
+
+            for iteration in range(max_iter):
+                if self.app.stop_requested:
+                    raise RuntimeError("Stopped by user")
+
+                head_px = self._get_fresh_marker_pixel(0)
+                pixel_err = np.array([corner_px[0] - head_px[0],
+                                      corner_px[1] - head_px[1]])
+                err_mag = np.linalg.norm(pixel_err)
+
+                if err_mag < convergence_px:
+                    self._log_autocal(
+                        f"  Corner {corner_id} converged at iter {iteration} "
+                        f"(err={err_mag:.1f}px)")
+                    break
+
+                # Convert pixel error to step delta via inverse Jacobian
+                step_delta = J_inv @ pixel_err
+                dx_step = int(round(step_delta[0]))
+                dy_step = int(round(step_delta[1]))
+
+                # Safety cap
+                if abs(dx_step) > max_jog or abs(dy_step) > max_jog:
+                    scale = max_jog / max(abs(dx_step), abs(dy_step))
+                    dx_step = int(dx_step * scale)
+                    dy_step = int(dy_step * scale)
+                    self._log_autocal(f"  (jog capped to ±{max_jog})")
+
+                self._log_autocal(
+                    f"  iter {iteration}: err {err_mag:.1f}px → jog "
+                    f"X{dx_step:+d} Y{dy_step:+d}")
+
+                cmd_parts = []
+                if dx_step != 0:
+                    cmd_parts.append(f"X{dx_step}")
+                if dy_step != 0:
+                    cmd_parts.append(f"Y{dy_step}")
+                if cmd_parts:
+                    if not self.app.send_motion("M " + " ".join(cmd_parts),
+                                                 enforce_limits=True, clamp_z_p=False):
+                        raise RuntimeError(f"Jog failed at corner {corner_id}")
+                    time.sleep(0.3)
+            else:
+                raise RuntimeError(
+                    f"Corner {corner_id} did not converge within {max_iter} iterations"
+                )
+
+            # Record the paired observation
+            final_head_px = self._get_fresh_marker_pixel(0)
+            step_points.append((self.app.current_position["X"],
+                                self.app.current_position["Y"]))
+            pixel_points.append(final_head_px)
+            self._log_autocal(
+                f"  Logged corner {corner_id}: step={step_points[-1]} px={final_head_px}")
+
+        # ---- Step 4: fit the homography ----
+        self._log_autocal("Fitting homography...")
+        cal = Calibration.from_four_points(pixel_points, step_points)
         self.app.calibration = cal
         self.app.save_vision_to_config()
-        messagebox.showinfo("Calibration saved",
-            f"Calibration ready.\n\n"
-            f"Pixel A ({self._cal_anchor_pixels[0][0]:.0f}, {self._cal_anchor_pixels[0][1]:.0f}) "
-            f"↔ step {self._cal_anchor_steps[0]}\n"
-            f"Pixel B ({self._cal_anchor_pixels[1][0]:.0f}, {self._cal_anchor_pixels[1][1]:.0f}) "
-            f"↔ step {self._cal_anchor_steps[1]}")
+        self._log_autocal(f"Done. {len(step_points)} points saved.")
         self._refresh_status_labels()
+        messagebox.showinfo("Auto-calibration complete",
+            f"Calibration saved from {len(step_points)} corners.\n\n"
+            f"You can now draw a boundary and set a home point.")
+
+    def _get_fresh_marker_pixel(self, marker_id: int) -> tuple[float, float]:
+        """Grab the latest frame, run detection, return the center pixel of
+        the requested marker. Raises if not detected after a few retries."""
+        cam = self.app.camera_overhead
+        for _ in range(10):
+            frame = cam.get_latest_frame()
+            if frame is not None:
+                from vision_module import detect_aruco_markers
+                dets = detect_aruco_markers(frame)
+                if marker_id in dets:
+                    cx, cy, _ = dets[marker_id]
+                    return (cx, cy)
+            time.sleep(0.1)
+        raise RuntimeError(f"Marker {marker_id} not detected after retries")
+
+    def _log_autocal(self, msg: str):
+        """Append-ish log — we only show the latest line in the sidebar
+        (space is tight), but print the full history to console."""
+        print(f"[autocal] {msg}")
+        self.autocal_log.config(text=msg, foreground="blue")
+        self.app.root.update()
 
     # --------------------------------------------------------
     # BOUNDARY POLYGON
