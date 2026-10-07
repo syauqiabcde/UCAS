@@ -1681,6 +1681,7 @@ class CameraFrame(ttk.Frame):
         self._pending_polygon: list[tuple[float, float]] = []
         self._last_photo = None    # keep a reference so tk doesn't GC it
         self._last_pil = None      # keep the underlying PIL image alive too
+        self._last_aruco = {}   # most recent {id: (cx, cy, corners)} from detector
         self._latest_frame_size = (1, 1)   # actual frame w,h (before display resize)
         self._display_size = (1, 1)        # displayed w,h
         self._cameras_started = False
@@ -1707,6 +1708,11 @@ class CameraFrame(ttk.Frame):
         self.poll_status = ttk.Label(left, text="Poll: not started",
                                     style="Normal.TLabel", foreground="gray")
         self.poll_status.pack(anchor="w", **pad)
+
+        # ArUco detection status
+        self.aruco_status = ttk.Label(left, text="ArUco: not seen",
+                                      style="Normal.TLabel", foreground="gray")
+        self.aruco_status.pack(anchor="w", **pad)
 
         ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
 
@@ -1870,6 +1876,22 @@ class CameraFrame(ttk.Frame):
         # Apply overlays
         head_step = (self.app.current_position["X"],
                     self.app.current_position["Y"])
+
+        # ---- ArUco detection ----
+        try:
+            from vision_module import detect_aruco_markers, draw_aruco_overlay
+            self._last_aruco = detect_aruco_markers(frame)
+        except Exception as e:
+            print(f"ArUco detection error: {e}")
+            self._last_aruco = {}
+
+        # Draw ArUco markers on top of the other overlays
+        try:
+            from vision_module import draw_aruco_overlay
+            draw_aruco_overlay(annotated, self._last_aruco)
+        except Exception as e:
+            print(f"ArUco overlay error: {e}")
+
         try:
             annotated = draw_overlays_on_frame(
                 frame, self.app.boundary, self.app.calibration,
@@ -1964,6 +1986,17 @@ class CameraFrame(ttk.Frame):
             self.head_status.config(text="Head camera not connected",
                                     foreground="gray")
 
+        # Update ArUco sidebar status
+        if self._last_aruco:
+            ids = sorted(self._last_aruco.keys())
+            all_corners = {1, 2, 3, 4}.issubset(ids)
+            self.aruco_status.config(
+                text=f"ArUco seen: {ids}",
+                foreground="green" if all_corners else "orange")
+        else:
+            self.aruco_status.config(text="ArUco: none detected",
+                                     foreground="orange")
+            
         self.after(self.FRAME_POLL_MS, self._poll_frame)
 
     # --------------------------------------------------------
