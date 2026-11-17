@@ -186,6 +186,12 @@ def default_config() -> dict:
         "autocal_max_iterations": 8,
         # Maximum step delta per single jog (safety cap, prevents runaway).
         "autocal_max_step_per_jog": 5000,
+        # ---- Solvent mixing (CO2 capture pipeline, V9) ----
+        "n_solvents": 4,
+        "solvent_names": ["MEA", "DEA", "Water", "Solvent 4",
+                          "Solvent 5", "Solvent 6", "Solvent 7", "Solvent 8"],
+        "solvent_target_volume_ml": 5.0,
+        "solvent_volume_per_cycle_ml": 0.1,
     }
 
 
@@ -205,6 +211,9 @@ def load_config() -> dict:
             entry.setdefault("Y", 0)
             entry.pop("Z_bottom", None)
             entry.pop("Z", None)
+        # Ensure a coordinate row exists for each solvent slot (V9)
+        for i in range(1, 9):
+            cfg["coordinates"].setdefault(f"solvent_{i}", {"X": 0, "Y": 0})
         return cfg
     except Exception as e:
         print(f"Config load failed ({e}); using defaults")
@@ -536,6 +545,52 @@ class SettingsDialog(tk.Toplevel):
             ), foreground="gray", justify="left"
                      ).pack(anchor="w", padx=8, pady=6)
 
+
+        # ---- Tab 5: Solvent mixing (V9) ----
+        tab_solv = ttk.Frame(nb)
+        nb.add(tab_solv, text="Solvent mixing")
+
+        sv_top = ttk.LabelFrame(tab_solv, text="Solvent setup")
+        sv_top.pack(fill="x", padx=8, pady=8)
+
+        ttk.Label(sv_top, text="Number of solvents (2-8):"
+                  ).grid(row=0, column=0, sticky="w", **pad)
+        self.sv_n = ttk.Entry(sv_top, width=6, justify="right")
+        self.sv_n.insert(0, str(cfg.get("n_solvents", 4)))
+        self.sv_n.grid(row=0, column=1, sticky="w", **pad)
+
+        ttk.Label(sv_top, text="Target volume per mix (mL):"
+                  ).grid(row=1, column=0, sticky="w", **pad)
+        self.sv_tgt = ttk.Entry(sv_top, width=10, justify="right")
+        self.sv_tgt.insert(0, str(cfg.get("solvent_target_volume_ml", 5.0)))
+        self.sv_tgt.grid(row=1, column=1, sticky="w", **pad)
+
+        ttk.Label(sv_top, text="Volume per 1 pipette cycle (mL):"
+                  ).grid(row=2, column=0, sticky="w", **pad)
+        self.sv_vpc = ttk.Entry(sv_top, width=10, justify="right")
+        self.sv_vpc.insert(0, str(cfg.get("solvent_volume_per_cycle_ml", 0.1)))
+        self.sv_vpc.grid(row=2, column=1, sticky="w", **pad)
+
+        sv_names = ttk.LabelFrame(tab_solv, text="Solvent names (slot -> chemical)")
+        sv_names.pack(fill="x", padx=8, pady=8)
+
+        self.sv_name_entries = []
+        names = cfg.get("solvent_names", [])
+        for i in range(8):
+            ttk.Label(sv_names, text=f"solvent_{i+1}:"
+                      ).grid(row=i, column=0, sticky="w", **pad)
+            e = ttk.Entry(sv_names, width=24)
+            e.insert(0, names[i] if i < len(names) else f"Solvent {i+1}")
+            e.grid(row=i, column=1, sticky="w", **pad)
+            self.sv_name_entries.append(e)
+
+        ttk.Label(tab_solv, text=(
+            "Set coordinates for each solvent_i in the 'Vial coordinates' tab.\n"
+            "Cycles per solvent = round(percent/100 * target_vol / vol_per_cycle).\n"
+            "The target vial reuses the 'target' entry shared with color mixing."
+        ), foreground="gray", justify="left"
+                  ).pack(anchor="w", padx=12, pady=6)
+
         # ---- Save / Cancel ----
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill="x", padx=10, pady=8)
@@ -563,6 +618,15 @@ class SettingsDialog(tk.Toplevel):
             if VISION_AVAILABLE:
                 self.cfg["camera_overhead_index"] = int(self.cam_ov.get())
                 self.cfg["camera_head_index"] = int(self.cam_hd.get())
+            # ---- Solvent mixing (V9) ----
+            n_solv = int(self.sv_n.get())
+            if not (2 <= n_solv <= 8):
+                raise ValueError("Number of solvents must be between 2 and 8.")
+            self.cfg["n_solvents"] = n_solv
+            self.cfg["solvent_target_volume_ml"] = float(self.sv_tgt.get())
+            self.cfg["solvent_volume_per_cycle_ml"] = float(self.sv_vpc.get())
+            self.cfg["solvent_names"] = [e.get().strip() or f"Solvent {i+1}"
+                                         for i, e in enumerate(self.sv_name_entries)]
         except ValueError:
             messagebox.showerror("Invalid input", "All values must be integers.")
             return
@@ -719,8 +783,11 @@ class UCASApp:
         ttk.Radiobutton(frame, text="Manual", variable=self.mode_var,
                         value="manual", command=lambda: self._show_mode("manual")
                         ).pack(side="left", padx=4)
-        ttk.Radiobutton(frame, text="Automatic", variable=self.mode_var,
+        ttk.Radiobutton(frame, text="Color mixing", variable=self.mode_var,
                         value="auto", command=lambda: self._show_mode("auto")
+                        ).pack(side="left", padx=4)
+        ttk.Radiobutton(frame, text="Solvent mixing", variable=self.mode_var,
+                        value="solvent", command=lambda: self._show_mode("solvent")
                         ).pack(side="left", padx=4)
         if VISION_AVAILABLE:
             ttk.Radiobutton(frame, text="Camera", variable=self.mode_var,
@@ -732,13 +799,15 @@ class UCASApp:
         self.mode_container.pack(fill="both", expand=True, padx=10, pady=6)
         self.manual_frame = ManualModeFrame(self.mode_container, self)
         self.auto_frame = AutoModeFrame(self.mode_container, self)
+        self.solvent_frame = SolventMixingFrame(self.mode_container, self)
         if VISION_AVAILABLE:
             self.camera_frame = CameraFrame(self.mode_container, self)
         else:
             self.camera_frame = None
 
     def _show_mode(self, mode: str):
-        for f in (self.manual_frame, self.auto_frame, self.camera_frame):
+        for f in (self.manual_frame, self.auto_frame,
+                  self.solvent_frame, self.camera_frame):
             if f is not None:
                 f.pack_forget()
         if mode == "manual":
@@ -747,6 +816,9 @@ class UCASApp:
         elif mode == "auto":
             self.auto_frame.pack(fill="both", expand=True)
             self.auto_frame.refresh_from_config()
+        elif mode == "solvent":
+            self.solvent_frame.pack(fill="both", expand=True)
+            self.solvent_frame.refresh_from_config()
         elif mode == "camera" and self.camera_frame is not None:
             self.camera_frame.pack(fill="both", expand=True)
             self.camera_frame.on_show()
@@ -1653,6 +1725,280 @@ class AutoModeFrame(ttk.Frame):
 
 
 # ============================================================
+# SOLVENT MIXING MODE (CO2 capture pipeline, V9)
+# ============================================================
+
+class SolventMixingFrame(ttk.Frame):
+    """Mix N solvents at user-specified percentages into the target vial.
+    Reuses the aspirate/dispense primitives from AutoModeFrame via the app."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.percent_vars = []
+        self.name_labels = []
+        self.planned_cycles = []
+        self.current_action_list = []
+
+        pad = {"padx": 8, "pady": 6}
+
+        # ---- Left column: percentage table + summary ----
+        left = ttk.LabelFrame(self, text="Mix recipe")
+        left.grid(row=0, column=0, sticky="nw", padx=8, pady=8)
+
+        ttk.Label(left, text="Slot", style="Big.TLabel"
+                  ).grid(row=0, column=0, **pad)
+        ttk.Label(left, text="Solvent", style="Big.TLabel"
+                  ).grid(row=0, column=1, **pad)
+        ttk.Label(left, text="Percent (%)", style="Big.TLabel"
+                  ).grid(row=0, column=2, **pad)
+
+        self._rows = []
+        for i in range(8):
+            slot_lbl = ttk.Label(left, text=f"solvent_{i+1}")
+            slot_lbl.grid(row=i + 1, column=0, sticky="w", **pad)
+            name_lbl = ttk.Label(left, text="", width=20)
+            name_lbl.grid(row=i + 1, column=1, sticky="w", **pad)
+            var = tk.StringVar(value="0")
+            entry = ttk.Entry(left, textvariable=var, width=8, justify="right")
+            entry.grid(row=i + 1, column=2, sticky="w", **pad)
+            var.trace_add("write", lambda *a: self._refresh_total())
+            self.percent_vars.append(var)
+            self.name_labels.append(name_lbl)
+            self._rows.append((slot_lbl, name_lbl, entry))
+
+        self.total_lbl = ttk.Label(left, text="Total: 0.0 %",
+                                   style="Big.TLabel", foreground="red")
+        self.total_lbl.grid(row=10, column=0, columnspan=3, sticky="w", **pad)
+
+        self.summary_lbl = ttk.Label(left, text="", style="Normal.TLabel",
+                                     foreground="gray", justify="left")
+        self.summary_lbl.grid(row=11, column=0, columnspan=3, sticky="w", **pad)
+
+        ttk.Button(left, text="Compute plan", command=self._compute_plan,
+                   style="Big.TButton", width=16
+                   ).grid(row=12, column=0, columnspan=2, sticky="w", **pad)
+        self.start_btn = ttk.Button(left, text="START mixing",
+                                    command=self._on_start,
+                                    style="Big.TButton", width=16,
+                                    state="disabled")
+        self.start_btn.grid(row=12, column=2, sticky="w", **pad)
+
+        # ---- Right column: action plan ----
+        right = ttk.Frame(self)
+        right.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        ttk.Label(right, text="Planned actions:", style="Big.TLabel"
+                  ).pack(anchor="w")
+        self.action_box = tk.Text(right, height=24, width=70,
+                                  font=("Consolas", 12))
+        self.action_box.pack(fill="both", expand=True, pady=4)
+        self.action_box.tag_configure("running", background="yellow")
+        self.action_box.tag_configure("done", foreground="gray")
+        self.action_box.tag_configure("aborted", foreground="red")
+
+    # ---- Public ----
+    def refresh_from_config(self):
+        """Pull solvent count + names from config and show/hide rows."""
+        n = int(self.app.cfg.get("n_solvents", 4))
+        names = self.app.cfg.get("solvent_names", [])
+        for i, (slot_lbl, name_lbl, entry) in enumerate(self._rows):
+            if i < n:
+                slot_lbl.grid()
+                name_lbl.grid()
+                entry.grid()
+                name_lbl.config(
+                    text=names[i] if i < len(names) else f"Solvent {i+1}")
+            else:
+                slot_lbl.grid_remove()
+                name_lbl.grid_remove()
+                entry.grid_remove()
+        self._refresh_total()
+
+    # ---- Validation & planning ----
+    def _parse_percents(self):
+        n = int(self.app.cfg.get("n_solvents", 4))
+        out = []
+        for i in range(n):
+            try:
+                v = float(self.percent_vars[i].get() or "0")
+            except ValueError:
+                return None
+            if v < 0:
+                return None
+            out.append(v)
+        return out
+
+    def _refresh_total(self):
+        pcts = self._parse_percents()
+        if pcts is None:
+            self.total_lbl.config(text="Total: - (invalid entry)",
+                                  foreground="red")
+            return
+        total = sum(pcts)
+        ok = abs(total - 100.0) < 0.01
+        self.total_lbl.config(text=f"Total: {total:.2f} %",
+                              foreground="green" if ok else "red")
+
+    def _compute_plan(self):
+        pcts = self._parse_percents()
+        if pcts is None:
+            messagebox.showwarning("Invalid percentages",
+                "Each percentage must be a non-negative number.")
+            return
+        total = sum(pcts)
+        if abs(total - 100.0) > 0.01:
+            messagebox.showwarning("Total must be 100%",
+                f"Current total is {total:.2f}%. Adjust percentages to sum to 100.")
+            return
+
+        target_vol = float(self.app.cfg["solvent_target_volume_ml"])
+        vol_per_cycle = float(self.app.cfg["solvent_volume_per_cycle_ml"])
+        if vol_per_cycle <= 0:
+            messagebox.showerror("Bad calibration",
+                "Volume per pipette cycle must be > 0 (Settings -> Solvent mixing).")
+            return
+
+        names = self.app.cfg.get("solvent_names", [])
+        n = int(self.app.cfg["n_solvents"])
+
+        cycles = []
+        for i in range(n):
+            vol_i = pcts[i] / 100.0 * target_vol
+            c_i = int(round(vol_i / vol_per_cycle))
+            cycles.append(c_i)
+        self.planned_cycles = cycles
+        actual_vol = sum(cycles) * vol_per_cycle
+
+        warn = []
+        for i, c in enumerate(cycles):
+            if pcts[i] > 0 and c == 0:
+                nm = names[i] if i < len(names) else f"Solvent {i+1}"
+                warn.append(
+                    f"solvent_{i+1} ({nm}): {pcts[i]}% rounds to 0 cycles - "
+                    f"increase target volume or decrease vol/cycle")
+        self.summary_lbl.config(
+            text=(f"Nominal: {target_vol:.3f} mL | "
+                  f"Actual (rounded): {actual_vol:.3f} mL\n"
+                  + ("\n".join(warn) if warn else "")),
+            foreground="orange" if warn else "gray")
+
+        tgt = self.app.cfg["coordinates"].get("target", {"X": 0, "Y": 0})
+        actions = []
+        for i in range(n):
+            if cycles[i] == 0:
+                continue
+            slot = f"solvent_{i+1}"
+            src = self.app.cfg["coordinates"].get(slot, {"X": 0, "Y": 0})
+            label_name = names[i] if i < len(names) else slot
+            for c in range(cycles[i]):
+                tag = f"[{slot} ({label_name}) cyc {c+1}/{cycles[i]}]"
+                actions.append({"kind": "aspirate",
+                                "text": f"{tag} Aspirate from {slot}",
+                                "src": src})
+                actions.append({"kind": "dispense",
+                                "text": f"{tag} Dispense into target",
+                                "tgt": tgt})
+        self.current_action_list = actions
+
+        self.action_box.delete("1.0", tk.END)
+        self.action_box.insert(tk.END,
+            f"Target vol  : {target_vol:.3f} mL (nominal)\n"
+            f"Per cycle   : {vol_per_cycle:.3f} mL\n"
+            f"Actual vol  : {actual_vol:.3f} mL  "
+            f"({sum(cycles)} cycles)\n\n")
+        for i in range(n):
+            nm = names[i] if i < len(names) else f"Solvent {i+1}"
+            self.action_box.insert(tk.END,
+                f"  solvent_{i+1} ({nm:<16s}) "
+                f"{pcts[i]:>5.1f}%  -> {cycles[i]} cycles\n")
+        self._header_lines = 3 + 1 + n + 1 + 1   # for highlight offset
+        self.action_box.insert(tk.END, "\n--- Planned actions ---\n")
+        for i, a in enumerate(actions, 1):
+            self.action_box.insert(tk.END, f"{i:03d}: {a['text']}\n")
+
+        self.start_btn.configure(state="normal" if actions else "disabled")
+
+    # ---- Execution ----
+    def _on_start(self):
+        if not self.current_action_list:
+            messagebox.showinfo("No plan", "Compute a plan first.")
+            return
+        if not self.app.ser or not self.app.ser.is_open:
+            messagebox.showwarning("Not connected", "Connect to Arduino first.")
+            return
+
+        aspirate = self.app.auto_frame._do_aspirate
+        dispense = self.app.auto_frame._do_dispense
+        offset = getattr(self, "_header_lines", 0)
+
+        self.app.clear_stop()
+        self.start_btn.configure(state="disabled")
+        self.app.status.config(text="SOLVENT: running mix", foreground="blue")
+        self.app.root.update()
+
+        try:
+            for i, act in enumerate(self.current_action_list):
+                if self.app.stop_requested:
+                    self._mark_aborted_from(i, offset)
+                    self.app.status.config(
+                        text=f"SOLVENT STOPPED before action {i+1}",
+                        foreground="red")
+                    messagebox.showwarning("Force stopped",
+                        f"Aborted. {len(self.current_action_list) - i} "
+                        f"action(s) discarded.")
+                    self.start_btn.configure(state="normal")
+                    return
+
+                ln = offset + i + 1
+                self.action_box.tag_remove("running", "1.0", tk.END)
+                self.action_box.tag_add("running", f"{ln}.0", f"{ln}.end")
+                self.action_box.see(f"{ln}.0")
+                self.app.status.config(
+                    text=f"SOLVENT {i+1}/{len(self.current_action_list)}: "
+                         f"{act['text']}",
+                    foreground="blue")
+                self.app.root.update()
+
+                ok = (aspirate(act["src"]) if act["kind"] == "aspirate"
+                      else dispense(act["tgt"]))
+
+                if not ok:
+                    if self.app.stop_requested:
+                        self._mark_aborted_from(i, offset)
+                        self.app.status.config(
+                            text=f"SOLVENT STOPPED during action {i+1}",
+                            foreground="red")
+                    else:
+                        messagebox.showerror("Solvent mix stopped",
+                            f"Action {i+1} failed:\n\n{act['text']}")
+                        self.app.status.config(
+                            text=f"SOLVENT STOPPED at {i+1}", foreground="red")
+                    self.start_btn.configure(state="normal")
+                    return
+
+                self.action_box.tag_remove("running", f"{ln}.0", f"{ln}.end")
+                self.action_box.tag_add("done", f"{ln}.0", f"{ln}.end")
+        except Exception as e:
+            messagebox.showerror("Solvent mix error", str(e))
+            self.app.status.config(text="SOLVENT error", foreground="red")
+            self.start_btn.configure(state="normal")
+            return
+
+        self.app.status.config(text="SOLVENT complete", foreground="green")
+        messagebox.showinfo("Mixing complete", "Solvent mixing finished.")
+        self.start_btn.configure(state="normal")
+
+    def _mark_aborted_from(self, action_index, offset):
+        self.action_box.tag_remove("running", "1.0", tk.END)
+        for j in range(action_index, len(self.current_action_list)):
+            ln = offset + j + 1
+            self.action_box.tag_add("aborted", f"{ln}.0", f"{ln}.end")
+
+
+# ============================================================
 # CAMERA MODE (V8)
 # ============================================================
 
@@ -1681,7 +2027,6 @@ class CameraFrame(ttk.Frame):
         self._pending_polygon: list[tuple[float, float]] = []
         self._last_photo = None    # keep a reference so tk doesn't GC it
         self._last_pil = None      # keep the underlying PIL image alive too
-        self._last_aruco = {}   # most recent {id: (cx, cy, corners)} from detector
         self._latest_frame_size = (1, 1)   # actual frame w,h (before display resize)
         self._display_size = (1, 1)        # displayed w,h
         self._cameras_started = False
@@ -1708,11 +2053,6 @@ class CameraFrame(ttk.Frame):
         self.poll_status = ttk.Label(left, text="Poll: not started",
                                     style="Normal.TLabel", foreground="gray")
         self.poll_status.pack(anchor="w", **pad)
-
-        # ArUco detection status
-        self.aruco_status = ttk.Label(left, text="ArUco: not seen",
-                                      style="Normal.TLabel", foreground="gray")
-        self.aruco_status.pack(anchor="w", **pad)
 
         ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
 
@@ -1876,22 +2216,6 @@ class CameraFrame(ttk.Frame):
         # Apply overlays
         head_step = (self.app.current_position["X"],
                     self.app.current_position["Y"])
-
-        # ---- ArUco detection ----
-        try:
-            from vision_module import detect_aruco_markers, draw_aruco_overlay
-            self._last_aruco = detect_aruco_markers(frame)
-        except Exception as e:
-            print(f"ArUco detection error: {e}")
-            self._last_aruco = {}
-
-        # Draw ArUco markers on top of the other overlays
-        try:
-            from vision_module import draw_aruco_overlay
-            draw_aruco_overlay(annotated, self._last_aruco)
-        except Exception as e:
-            print(f"ArUco overlay error: {e}")
-
         try:
             annotated = draw_overlays_on_frame(
                 frame, self.app.boundary, self.app.calibration,
@@ -1986,17 +2310,6 @@ class CameraFrame(ttk.Frame):
             self.head_status.config(text="Head camera not connected",
                                     foreground="gray")
 
-        # Update ArUco sidebar status
-        if self._last_aruco:
-            ids = sorted(self._last_aruco.keys())
-            all_corners = {1, 2, 3, 4}.issubset(ids)
-            self.aruco_status.config(
-                text=f"ArUco seen: {ids}",
-                foreground="green" if all_corners else "orange")
-        else:
-            self.aruco_status.config(text="ArUco: none detected",
-                                     foreground="orange")
-            
         self.after(self.FRAME_POLL_MS, self._poll_frame)
 
     # --------------------------------------------------------
